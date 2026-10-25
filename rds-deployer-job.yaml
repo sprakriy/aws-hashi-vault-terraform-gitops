@@ -1,0 +1,68 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: terraform-runner
+  namespace: vault 
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rds-config
+  namespace: vault
+data:
+  AWS_REGION: "us-east-1"
+  TF_STATE_BUCKET: "sp-01102026-aws-kub"
+  TF_STATE_KEY: "rds/terraform.tfstate"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: rds-deployer
+  namespace: vault
+spec:
+  template:
+    spec:
+      serviceAccountName: terraform-runner
+      # Fixes permission issues for the non-root Terraform container
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+      - name: git-cloner
+        image: alpine/git
+        # Cloning into a subdirectory avoids permissions locks on the root of the volume mount
+        args: ["clone", "https://github.com/sprakriy/aws-hybrid-project.git", "/src/aws-hybrid-project"]
+        volumeMounts:
+        - name: code
+          mountPath: /src
+      containers:
+      - name: terraform-executor
+        image: hashicorp/terraform:latest
+        workingDir: /src/aws-hybrid-project  # Target the subdirectory where the files live
+        env:
+        - name: TF_VAR_db_username
+          value: "dbadmin"
+        - name: TF_VAR_db_password
+          value: "supersecretpassword"
+        envFrom:
+        - configMapRef:
+            name: rds-config
+        - secretRef:
+            name: aws-creds
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            terraform init \
+              -backend-config="bucket=${AWS_REGION}" \
+              -backend-config="key=${TF_STATE_KEY}" \
+              -backend-config="region=${AWS_REGION}"
+            terraform apply -auto-approve
+        volumeMounts:
+        - name: code
+          mountPath: /src
+      restartPolicy: Never
+      volumes:
+      - name: code
+        emptyDir: {}
+
