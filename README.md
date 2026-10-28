@@ -1,143 +1,230 @@
-### Automated Cloud Infrastructure Pipeline Runner
-
-This repository contains the architecture and manifests required to automate infrastructure delivery using ephemeral, cloud-native runner nodes. The architecture leverages secure orchestration spaces to check out source code dynamically, run compliance validation, maintain remote state locking, and securely provision resources directly inside **Amazon Web Services (AWS)**. 
-
-### Architecture Workflow
-
-mermaid
-
+Automated Ephemeral Terraform Runner on Kubernetes (k3d + Vault + S3)
+An end-to-end GitOps/Kubernetes pattern for executing non-interactive, stateless Terraform deployments and teardowns using dynamic AWS credentials provided by HashiCorp Vault and remote state stored in S3.
+By changing the `GIT_REPO_URL` and target state details in the Kubernetes manifests, you can re-use this pattern for any infrastructure repository.
+---
+Architecture Overview
+```mermaid
 graph TD
-    subgraph Execution Control Plane
-        A[Orchestration Engine / API Server] -->|Apply Manifests| B[Isolated Namespace Worker]
-        subgraph Security and Execution Blocks
-            B --> C[Secret Management Store]
-            B --> D[Automated Deployer Engine]
+    subgraph K3D["k3d Kubernetes Cluster"]
+        subgraph VaultNS["vault namespace"]
+            Vault["HashiCorp Vault\n(AWS Secrets Engine)"]
+        end
+
+        subgraph Workloads["default namespace"]
+            Deployer["Kubernetes Job:\nec2-deployer"]
+            Destroyer["Kubernetes Job:\nec2-destroyer"]
+            ConfigMap["ConfigMap:\nec2-tf-config\n(Bucket, Key, Region)"]
         end
     end
 
-    subgraph Amazon Web Services AWS
-        D -->|1. Authenticate Infrastructure| E[AWS IAM / API Gateway]
-        D -->|2. Secure State Exchange| F[S3 Bucket: State Matrix Storage]
-        D -->|3. Provision Target Services| G[Managed RDS Database Layers]
+    subgraph External["External Cloud Infrastructure"]
+        S3["AWS S3 Bucket\n(Remote Terraform State)"]
+        AWS_IAM["AWS IAM / STS\n(Identity & Access Management)"]
+        EC2["AWS EC2 / Target Infrastructure"]
     end
 
-    style B fill:#326ce5,stroke:#fff,stroke-width:2mm,color:#fff
-    style C fill:#000,stroke:#fff,stroke-width:1mm,color:#fff
-    style D fill:#f6a,stroke:#333,stroke-width:1mm
-    style F fill:#ff9900,stroke:#333,stroke-width:1mm
-    style G fill:#ff9900,stroke:#333,stroke-width:1mm
+    %% Flow interactions
+    ConfigMap -. Inject Config .-> Deployer
+    ConfigMap -. Inject Config .-> Destroyer
 
-Use code with caution.
+    Deployer -- 1. Request AWS Creds --> Vault
+    Vault -- 2. Create Dynamic IAM User --> AWS_IAM
+    Vault -- 3. Access/Secret Keys --> Deployer
+    
+    Deployer -- 4. Wait 10-15s (IAM Propagation) --> Deployer
+    Deployer -- 5. Clone Target Repo --> Deployer
+    Deployer -- 6. terraform init / apply --> S3
+    Deployer -- 7. Provision Resources --> EC2
 
-### Core Infrastructure Milestones
-
-* **Decoupled Architecture:** Fully isolated the state management engine and execution pods into dedicated, restricted namespaces.
-* **Cross-Platform Security:** Established stable network egress paths out to public cloud provider API interfaces.
-* **Remote State Locking:** Successfully implemented a centralized remote state backend architecture utilizing authenticated S3 tracking loops.
-
-### File Manifest Structure
-
-### 1. The Runner Manifest (rds-deployer-job.yaml)
-
-This manifest constructs an ephemeral runtime workspace that automatically checks out source code via an initial file compilation container and executes the plan using an unprivileged, non-root user configuration layout (fsGroup: 1000). 
-
-yaml
-
+    Destroyer -- 1. Request AWS Creds --> Vault
+    Vault -- 2. Create Dynamic IAM User --> AWS_IAM
+    Vault -- 3. Access/Secret Keys --> Destroyer
+    
+    Destroyer -- 4. Wait 10-15s (IAM Propagation) --> Destroyer
+    Destroyer -- 5. Clone Target Repo --> Destroyer
+    Destroyer -- 6. terraform init -backend-config --> S3
+    Destroyer -- 7. terraform destroy --> EC2
+```
 ---
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: terraform-runner
-  namespace: vault
+Key Lessons Learned
+> **CRITICAL: IAM Credentials Propagation Delay**  
+> When Vault generates dynamic IAM credentials (`credential_type = iam-user`), AWS requires a **10–15 second global propagation window** before those temporary access keys are recognized by S3, STS, or EC2 endpoints. Running `terraform init` immediately upon receiving keys from Vault will result in sporadic `403 InvalidClientTokenId` or `AccessDenied` errors. An explicit delay (`sleep 15`) is mandatory prior to execution.
 ---
+Step 1: Local Environment Setup
+1. Create k3d Cluster
+```bash
+k3d cluster create tf-runner-cluster --agents 1
+```
+2. Install HashiCorp Vault via Helm
+```bash
+helm repo add hashicorp https://helm.releases.hashicorp.com
+helm repo update
+
+kubectl create namespace vault
+
+helm install vault hashicorp/vault \
+  --namespace vault \
+  --set "server.dev.enabled=true" \
+  --set "server.dev.devRootToken=root"
+```
+3. Configure Vault AWS Secrets Engine
+Exec into the Vault pod to enable and configure the AWS secrets engine with your master administrative AWS keys:
+```bash
+kubectl exec -it vault-0 -n vault -- sh
+```
+Inside `vault-0`:
+```sh
+# Enable AWS Secrets Engine
+vault secrets enable aws
+
+# Configure AWS Root credentials in Vault
+vault write aws/config/root \
+    access_key="YOUR_AWS_ROOT_ACCESS_KEY" \
+    secret_key="YOUR_AWS_ROOT_SECRET_KEY" \
+    region="us-east-1"
+
+# Create a role for Terraform with IAM user dynamic credentials
+vault write aws/roles/terraform-role \
+    credential_type=iam-user \
+    policy_arns="arn:aws:iam::aws:policy/AdministratorAccess"
+
+exit
+```
+---
+Step 2: Shared ConfigMap
+Create the ConfigMap containing the S3 state configuration used by both deployer and destroyer jobs:
+```yaml
+cat <<EOF | kubectl apply -f -
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: rds-config
-  namespace: vault
+  name: ec2-tf-config
 data:
+  TF_STATE_BUCKET: "your-terraform-state-bucket-name"
+  TF_STATE_KEY: "ec2-vault/terraform.tfstate"
   AWS_REGION: "us-east-1"
-  TF_STATE_BUCKET: "sp-01102026-aws-kub"
-  TF_STATE_KEY: "rds/terraform.tfstate"
+  GIT_REPO_URL: "https://github.com/your-org/your-tf-repo.git"
+EOF
+```
 ---
+Step 3: Deployment Job (`ec2-deployer.yaml`)
+This job clones the specified Git repository, injects the backend configuration, waits for IAM credentials to propagate, and runs `terraform apply`.
+```yaml
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: rds-deployer
-  namespace: vault
+  name: ec2-deployer
 spec:
+  ttlSecondsAfterFinished: 300
   template:
     spec:
-      serviceAccountName: terraform-runner
-      securityContext:
-        fsGroup: 1000
-      initContainers:
-      - name: git-cloner
-        image: alpine/git
-        args: ["clone", "https://github.com/sprakriy/aws-hybrid-project.git", "/src/aws-hybrid-project"]
-        volumeMounts:
-        - name: code
-          mountPath: /src
+      restartPolicy: Never
       containers:
-      - name: terraform-executor
+      - name: terraform-runner
         image: hashicorp/terraform:latest
-        workingDir: /src/aws-hybrid-project
-        env:
-        - name: TF_VAR_db_username
-          value: "dbadmin"
-        - name: TF_VAR_db_password
-          value: "supersecretpassword"
-        envFrom:
-        - configMapRef:
-            name: rds-config
-        - secretRef:
-            name: aws-creds
+        workingDir: /src
         command: ["/bin/sh", "-c"]
         args:
           - |
             set -e
-            terraform init \
-              -backend-config="bucket=${TF_STATE_BUCKET}" \
-              -backend-config="key=${TF_STATE_KEY}" \
-              -backend-config="region=${AWS_REGION}"
+
+            echo "==> Installing utilities (curl, git, jq)..."
+            apk add --no-cache curl git jq
+
+            echo "==> Fetching dynamic AWS credentials from Vault..."
+            VAULT_RESPONSE=$(curl -s --fail \
+              --header "X-Vault-Token: root" \
+              http://vault.vault.svc.cluster.local:8200/v1/aws/creds/terraform-role)
+
+            export AWS_ACCESS_KEY_ID=$(echo "$VAULT_RESPONSE" | jq -r '.data.access_key')
+            export AWS_SECRET_ACCESS_KEY=$(echo "$VAULT_RESPONSE" | jq -r '.data.secret_key')
+
+            echo "==> WAITING 15 Seconds for AWS IAM Global Credential Propagation..."
+            sleep 15
+
+            echo "==> Cloning infrastructure repository..."
+            git clone "${GIT_REPO_URL}" .
+
+            echo "==> Generating backend configuration..."
+            cat <<EOF > backend.hcl
+            bucket = "${TF_STATE_BUCKET}"
+            key    = "${TF_STATE_KEY}"
+            region = "${AWS_REGION}"
+            EOF
+
+            echo "==> Initializing Terraform..."
+            terraform init -backend-config=backend.hcl
+
+            echo "==> Executing Terraform Apply..."
             terraform apply -auto-approve
-        volumeMounts:
-        - name: code
-          mountPath: /src
+
+        envFrom:
+        - configMapRef:
+            name: ec2-tf-config
+```
+Run deployment:
+```bash
+kubectl apply -f ec2-deployer.yaml
+kubectl logs -f job/ec2-deployer
+```
+---
+Step 4: Destruction Job (`ec2-destroyer.yaml`)
+This job connects to the exact same remote S3 state file using dynamic credentials and completely tears down all managed infrastructure.
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ec2-destroyer
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
       restartPolicy: Never
-      volumes:
-      - name: code
-        emptyDir: {}
+      containers:
+      - name: terraform-runner
+        image: hashicorp/terraform:latest
+        workingDir: /src
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
 
-Use code with caution.
+            echo "==> Installing utilities (curl, git, jq)..."
+            apk add --no-cache curl git jq
 
-### Pipeline Execution Guide
+            echo "==> Fetching dynamic AWS credentials from Vault..."
+            VAULT_RESPONSE=$(curl -s --fail \
+              --header "X-Vault-Token: root" \
+              http://vault.vault.svc.cluster.local:8200/v1/aws/creds/terraform-role)
 
-### Initialization
+            export AWS_ACCESS_KEY_ID=$(echo "$VAULT_RESPONSE" | jq -r '.data.access_key')
+            export AWS_SECRET_ACCESS_KEY=$(echo "$VAULT_RESPONSE" | jq -r '.data.secret_key')
 
-Ensure your runtime environment contains the necessary identity provider details before executing the runner script: 
+            echo "==> WAITING 15 Seconds for AWS IAM Global Credential Propagation..."
+            sleep 15
 
-bash
+            echo "==> Cloning infrastructure repository..."
+            git clone "${GIT_REPO_URL}" .
 
-oc create secret generic aws-creds -n vault \
-  --from-literal=AWS_ACCESS_KEY_ID="YOUR_AWS_ACCESS_KEY" \
-  --from-literal=AWS_SECRET_ACCESS_KEY="YOUR_AWS_SECRET_KEY"
+            echo "==> Generating backend configuration..."
+            cat <<EOF > backend.hcl
+            bucket = "${TF_STATE_BUCKET}"
+            key    = "${TF_STATE_KEY}"
+            region = "${AWS_REGION}"
+            EOF
 
-Use code with caution.
+            echo "==> Initializing Terraform..."
+            terraform init -backend-config=backend.hcl
 
-### Triggering the Execution Runner
+            echo "==> Executing Terraform Destroy..."
+            terraform destroy -auto-approve
 
-To prevent immutable tracking conflicts with older pipeline execution logs, wipe previous runs from the orchestrator and apply the clean manifest layer: 
-
-bash
-
-# 1. Purge the existing job execution history
-oc delete job rds-deployer -n vault --ignore-not-found=true
-
-# 2. Deploy the latest infrastructure manifest configuration
-oc apply -f rds-deployer-job.yaml -n vault
-
-# 3. Stream deployment output in real time
-oc logs job/rds-deployer -c terraform-executor -n vault -f
-
-Use code with caution.
+        envFrom:
+        - configMapRef:
+            name: ec2-tf-config
+```
+Run teardown:
+```bash
+kubectl apply -f ec2-destroyer.yaml
+kubectl logs -f job/ec2-destroyer
+```

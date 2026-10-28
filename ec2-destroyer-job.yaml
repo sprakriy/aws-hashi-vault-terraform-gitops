@@ -1,0 +1,90 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: terraform-runner
+  namespace: vault 
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ec2-destroy-config
+  namespace: vault
+data:
+  AWS_REGION: "us-east-1"
+  TF_STATE_BUCKET: "sp-01102026-aws-kub"
+  TF_STATE_KEY: "ec2-vault/terraform.tfstate"
+  VAULT_ADDR: "http://vault.vault.svc.cluster.local:8200"
+  VAULT_TOKEN: "root"
+  GIT_REPO_URL: "https://github.com/sprakriy/ci-cd-testing.git"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ec2-destroyer
+  namespace: vault
+spec:
+  template:
+    spec:
+      serviceAccountName: terraform-runner
+      securityContext:
+        fsGroup: 1000
+      containers:
+      - name: terraform-executor
+        image: hashicorp/terraform:latest
+        workingDir: /src/
+        # volumeMounts:
+        # - name: code
+        # - mountPath: /src
+        envFrom:
+        - configMapRef:
+            name: ec2-destroy-config
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            
+            echo "==> Installing curl and jq..."
+            apk add --no-cache curl jq >/dev/null 2>&1 || true
+            echo "==> Cloning repository source code..."
+            git clone "${GIT_REPO_URL}" .
+            echo "==> Checking repository files in workspace..."
+            ls -la 
+
+            echo "==> Fetching dynamic AWS credentials from Vault..."
+            VAULT_RESPONSE=$(curl -s -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/aws/creds/terraform-role")
+            
+            export AWS_ACCESS_KEY_ID=$(echo "$VAULT_RESPONSE" | jq -r '.data.access_key')
+            export AWS_SECRET_ACCESS_KEY=$(echo "$VAULT_RESPONSE" | jq -r '.data.secret_key')
+
+            if [ -z "$AWS_ACCESS_KEY_ID" ] || [ "$AWS_ACCESS_KEY_ID" = "null" ]; then
+              echo "Error: Failed to retrieve dynamic AWS credentials from Vault."
+              exit 1
+            fi
+
+            echo "==> Injecting S3 backend configuration..."
+            cat <<EOF > backend.tf
+            terraform {
+              backend "s3" {}
+            }
+            EOF
+            echo "==> Verifying backend configuration variables..."
+            echo "Bucket: '${TF_STATE_BUCKET}'"
+            echo "Key: '${TF_STATE_KEY}'"
+            echo "Region: '${AWS_REGION}'"
+
+            echo "Let us 10 seconds to wait for the backend.tf file to be written..."
+            sleep 10
+
+            echo "==> Creating backend configuration file..."
+            cat <<EOF > backend.hcl
+            bucket = "${TF_STATE_BUCKET}"
+            key    = "${TF_STATE_KEY}"
+            region = "${AWS_REGION}"
+            EOF
+
+            echo "==> Initializing Terraform backend..."
+            terraform init -backend-config=backend.hcl
+            echo "==> Destroying infrastructure from S3 state..."
+            terraform destroy -auto-approve
+      restartPolicy: Never

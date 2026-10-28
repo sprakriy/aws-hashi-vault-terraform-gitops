@@ -1,0 +1,92 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: terraform-runner
+  namespace: vault 
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ec2-config
+  namespace: vault
+data:
+  AWS_REGION: "us-east-1"
+  TF_STATE_BUCKET: "sp-01102026-aws-kub"
+  TF_STATE_KEY: "ec2-vault/terraform.tfstate"
+  VAULT_ADDR: "http://vault.vault.svc.cluster.local:8200"
+  VAULT_TOKEN: "root"
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ec2-deployer
+  namespace: vault
+spec:
+  template:
+    spec:
+      serviceAccountName: terraform-runner
+      securityContext:
+        fsGroup: 1000
+      initContainers:
+      - name: git-cloner
+        image: alpine/git
+        args: ["clone", "https://github.com/sprakriy/ci-cd-testing.git", "/src/ci-cd-testing"]
+        volumeMounts:
+        - name: code
+          mountPath: /src
+      containers:
+      - name: terraform-executor
+        image: hashicorp/terraform:latest
+        workingDir: /src/ci-cd-testing
+        envFrom:
+        - configMapRef:
+            name: ec2-config
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            set -e
+            
+            echo "==> Installing curl and jq..."
+            apk add --no-cache curl jq >/dev/null 2>&1 || true
+
+            echo "==> Fetching dynamic AWS credentials from Vault..."
+            VAULT_RESPONSE=$(curl -s -H "X-Vault-Token: ${VAULT_TOKEN}" "${VAULT_ADDR}/v1/aws/creds/terraform-role")
+            #echo "Debug Vault Raw response: ${VAULT_RESPONSE}"
+
+            export AWS_ACCESS_KEY_ID=$(echo "$VAULT_RESPONSE" | jq -r '.data.access_key')
+            export AWS_SECRET_ACCESS_KEY=$(echo "$VAULT_RESPONSE" | jq -r '.data.secret_key')
+
+            if [ -z "$AWS_ACCESS_KEY_ID" ] || [ "$AWS_ACCESS_KEY_ID" = "null" ]; then
+              echo "Error: Failed to retrieve dynamic AWS credentials from Vault."
+              exit 1
+            fi
+            echo "==> Successfully obtained temporary IAM credentials from Vault."
+            # Dynamically inject the backend block so Terraform accepts the -backend-config flags
+            echo "==> Generating runtime backend configuration..."
+            cat <<EOF > backend.tf
+            terraform {
+              backend "s3" {}
+            }
+            EOF
+            echo "Let us 10 seconds to wait for the backend.tf file to be written..."
+            sleep 10
+            echo "==> Initializing Terraform..."
+            terraform init \
+              -backend-config="bucket=${TF_STATE_BUCKET}" \
+              -backend-config="key=${TF_STATE_KEY}" \
+              -backend-config="region=${AWS_REGION}" \
+              -backend-config="access_key=${AWS_ACCESS_KEY_ID}" \
+              -backend-config="secret_key=${AWS_SECRET_ACCESS_KEY}" \
+              -backend-config="skip_credentials_validation=true" \
+              -backend-config="skip_metadata_api_check=true"
+
+            echo "==> Applying Terraform configuration..."
+            terraform apply -auto-approve
+        volumeMounts:
+        - name: code
+          mountPath: /src
+      restartPolicy: Never
+      volumes:
+      - name: code
+        emptyDir: {}
